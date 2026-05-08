@@ -3,10 +3,12 @@ from telebot import types
 import sqlite3
 import random
 import string
+import requests
 
 # --- НАСТРОЙКИ ---
 BOT_TOKEN = '8693826106:AAHpDM2dhyB1tSnhAJbNtx62rNYmgvkWTxY' # Замените на ваш токен от @BotFather
 MAIN_ADMIN = 'iootbox'        # Главный админ (без @)
+PASTEBIN_API_KEY = 'eqZXUzvpOVb7rnh2-jIK5cqDTImGs4bT'  # Ваш API ключ Pastebin
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -16,7 +18,7 @@ def init_db():
     cursor = conn.cursor()
     # Таблица файлов
     cursor.execute('''CREATE TABLE IF NOT EXISTS files 
-                      (code TEXT PRIMARY KEY, file_id TEXT, file_type TEXT, description TEXT, password TEXT, uploader_id INTEGER)''')
+                      (code TEXT PRIMARY KEY, file_id TEXT, file_type TEXT, description TEXT, password TEXT, uploader_id INTEGER, uploader_username TEXT)''')
     # Таблица админов
     cursor.execute('''CREATE TABLE IF NOT EXISTS admins (username TEXT PRIMARY KEY)''')
     # Таблица каналов для обязательной подписки
@@ -30,6 +32,61 @@ init_db()
 user_states = {}
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def upload_to_pastebin(paste_text, api_dev_key=PASTEBIN_API_KEY):
+    """
+    Отправляет текст в Pastebin и возвращает ссылку на raw-версию.
+    """
+    if not api_dev_key:
+        return None
+    
+    url = "https://pastebin.com/api/api_post.php"
+    
+    data = {
+        'api_dev_key': api_dev_key,
+        'api_paste_code': paste_text,
+        'api_option': 'paste',
+        'api_paste_name': 'files_list.txt',
+        'api_paste_format': 'text'
+    }
+    
+    try:
+        response = requests.post(url, data=data, timeout=10)
+        
+        if response.status_code == 200 and response.text.startswith("https://pastebin.com/"):
+            paste_url = response.text.strip()
+            # Преобразуем в raw-ссылку
+            paste_code = paste_url.split("/")[-1]
+            raw_url = f"https://pastebin.com/raw/{paste_code}"
+            return raw_url
+        else:
+            return None
+    except Exception:
+        return None
+
+def get_all_files_list():
+    """Получает список всех файлов из БД в форматированном виде"""
+    conn = sqlite3.connect('filebot.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT code, file_id, file_type, description, password, uploader_id, uploader_username FROM files ORDER BY uploader_id')
+    files = cursor.fetchall()
+    conn.close()
+    
+    if not files:
+        return "📂 Список файлов пуст."
+    
+    result = "📁 СПИСОК ВСЕХ ФАЙЛОВ:\n\n"
+    for code, file_id, file_type, description, password, uploader_id, uploader_username in files:
+        result += f"🔑 Код: {code}\n"
+        result += f"📎 Тип: {file_type}\n"
+        result += f"🆔 ID файла: {file_id}\n"
+        result += f"📝 Описание: {description or 'Нет'}\n"
+        result += f"🔒 Пароль: {password or 'Нет'}\n"
+        result += f"👤 Юзернейм создателя: {uploader_username or 'Неизвестен'}\n"
+        result += f"🆔 ID создателя: {uploader_id}\n"
+        result += "-" * 30 + "\n"
+    
+    return result
+
 def is_admin(username):
     if username and username.lower() == MAIN_ADMIN.lower():
         return True
@@ -160,84 +217,6 @@ def process_download(chat_id, code, password):
 
     file_id, file_type, desc, real_password = row
 
-    # Если у файла есть пароль, а введенный пароль не совпадает
-    if real_password:
-        if password != real_password:
-            # Запоминаем код и запрашиваем пароль
-            user_states[chat_id] = {'code': code}
-            bot.send_message(chat_id, "🔒 Неверный пароль или пароль не указан. Введите пароль:")
-            bot.register_next_step_handler_by_chat_id(chat_id, ask_password_again)
-            return
-
-    # Если пароля нет, игнорируем переданный password (если он был)
-    caption = f"📝 *Описание:* {desc}" if desc else ""
-    try:
-        if file_type == 'document':
-            bot.send_document(chat_id, file_id, caption=caption, parse_mode="Markdown")
-        elif file_type == 'photo':
-            bot.send_photo(chat_id, file_id, caption=caption, parse_mode="Markdown")
-        elif file_type == 'video':
-            bot.send_video(chat_id, file_id, caption=caption, parse_mode="Markdown")
-        bot.send_message(chat_id, "✅ Файл отправлен!", reply_markup=get_main_menu(None))
-    except Exception as e:
-        bot.send_message(chat_id, "❌ Ошибка при отправке файла.")
-
-def ask_password_again(message):
-    """Повторный запрос пароля при неверном вводе"""
-    chat_id = message.chat.id
-    state = user_states.get(chat_id, {})
-    code = state.get('code')
-    
-    if not code:
-        bot.send_message(chat_id, "❌ Ошибка: код не найден. Попробуйте снова.")
-        return
-    
-    password = message.text.strip()
-    # Убираем состояние, чтобы при повторной ошибке создать новое
-    user_states.pop(chat_id, None)
-    process_download(chat_id, code, password)
-
-# Добавляем вспомогательный метод для регистрации шага по chat_id
-def register_next_step_handler_by_chat_id(chat_id, callback):
-    """Обертка для регистрации следующего шага по chat_id"""
-    @bot.message_handler(func=lambda m: m.chat.id == chat_id)
-    def handler(message):
-        callback(message)
-        # Отключаем обработчик после выполнения
-        bot.message_handlers.remove(handler)
-
-# Более простой способ: используем register_next_step_handler с фильтром
-# Переопределим функцию для запроса пароля с сохранением состояния
-def ask_password_again(message):
-    chat_id = message.chat.id
-    state = user_states.get(chat_id, {})
-    code = state.get('code')
-    
-    if not code:
-        bot.send_message(chat_id, "❌ Ошибка: код не найден. Попробуйте снова.")
-        return
-    
-    password = message.text.strip()
-    user_states.pop(chat_id, None)
-    process_download(chat_id, code, password)
-
-# Исправляем регистрацию шага - используем стандартный register_next_step_handler
-# В process_download нужно вызывать register_next_step_handler
-
-# Перепишем process_download для корректной работы с запросом пароля
-def process_download(chat_id, code, password):
-    conn = sqlite3.connect('filebot.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT file_id, file_type, description, password FROM files WHERE code=?', (code,))
-    row = cursor.fetchone()
-    conn.close()
-
-    if not row:
-        bot.send_message(chat_id, "❌ Файл с таким кодом не найден.", reply_markup=get_main_menu(None))
-        return
-
-    file_id, file_type, desc, real_password = row
-
     # Если у файла есть пароль
     if real_password:
         if password != real_password:
@@ -274,6 +253,94 @@ def ask_password_callback(message):
     user_states.pop(chat_id, None)
     process_download(chat_id, code, password)
 
+# --- АДМИН-КОМАНДЫ ---
+
+@bot.message_handler(commands=['files'])
+def send_files_list(message):
+    """Команда для админов - получить список всех файлов в Pastebin"""
+    if not is_admin(message.from_user.username):
+        bot.send_message(message.chat.id, "❌ У вас нет прав для этой команды.")
+        return
+    
+    # Отправляем уведомление о начале обработки
+    status_msg = bot.send_message(message.chat.id, "⏳ Собираю список файлов и загружаю в Pastebin...")
+    
+    # Получаем список файлов
+    files_text = get_all_files_list()
+    
+    if files_text == "📂 Список файлов пуст.":
+        bot.edit_message_text(files_text, message.chat.id, status_msg.message_id)
+        return
+    
+    # Загружаем в Pastebin
+    raw_url = upload_to_pastebin(files_text)
+    
+    if raw_url:
+        # Формируем сообщение с ссылкой
+        response_text = f"✅ Список всех файлов успешно загружен!\n\n🔗 Ссылка: {raw_url}\n\n📊 Статистика: файлов найдено - {files_text.count('🔑 Код:')}"
+        bot.edit_message_text(response_text, message.chat.id, status_msg.message_id)
+    else:
+        # Если не удалось загрузить в Pastebin, отправляем текстом
+        if len(files_text) <= 4000:
+            bot.edit_message_text(files_text, message.chat.id, status_msg.message_id)
+        else:
+            # Если текст слишком длинный, разбиваем на части
+            bot.edit_message_text("❌ Не удалось загрузить в Pastebin. Отправляю частями:", message.chat.id, status_msg.message_id)
+            for i in range(0, len(files_text), 3000):
+                bot.send_message(message.chat.id, files_text[i:i+3000], disable_web_page_preview=True)
+
+@bot.message_handler(commands=['delete'])
+def admin_delete(message):
+    if not is_admin(message.from_user.username): return
+    args = message.text.split()
+    if len(args) < 2: return
+    conn = sqlite3.connect('filebot.db')
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM files WHERE code=?', (args[1],))
+    conn.commit()
+    bot.send_message(message.chat.id, f"Результат: удалено {cursor.rowcount} шт.")
+    conn.close()
+
+@bot.message_handler(commands=['add_admin', 'del_admin'])
+def manage_admins(message):
+    if not is_main_admin(message.from_user.username): return
+    args = message.text.split()
+    if len(args) < 2: return
+    user = args[1].replace('@', '').lower()
+    conn = sqlite3.connect('filebot.db')
+    cursor = conn.cursor()
+    if 'add' in message.text:
+        cursor.execute('INSERT OR IGNORE INTO admins VALUES (?)', (user,))
+        bot.send_message(message.chat.id, f"✅ {user} теперь админ.")
+    else:
+        cursor.execute('DELETE FROM admins WHERE username=?', (user,))
+        bot.send_message(message.chat.id, f"❌ {user} больше не админ.")
+    conn.commit()
+    conn.close()
+
+@bot.message_handler(commands=['add_channel', 'del_channel'])
+def manage_channels(message):
+    if not is_main_admin(message.from_user.username): return
+    args = message.text.split()
+    conn = sqlite3.connect('filebot.db')
+    cursor = conn.cursor()
+    if 'add' in message.text and len(args) >= 3:
+        cursor.execute('INSERT OR REPLACE INTO channels VALUES (?, ?)', (args[1], args[2]))
+        bot.send_message(message.chat.id, "✅ Канал добавлен.")
+    elif 'del' in message.text and len(args) >= 2:
+        cursor.execute('DELETE FROM channels WHERE channel_id=?', (args[1],))
+        bot.send_message(message.chat.id, "❌ Канал удален.")
+    conn.commit()
+    conn.close()
+
+@bot.message_handler(func=lambda m: m.text == '🛠 Панель управления' and is_admin(m.from_user.username))
+def admin_panel(message):
+    text = "🛠 *Панель управления*\n\n`/files` — получить список всех файлов\n`/delete КОД` — удалить файл\n"
+    if is_main_admin(message.from_user.username):
+        text += "\n👑 *GA Команды:*\n`/add_admin @user` / `/del_admin @user`"
+        text += "\n`/add_channel @id link`\n`/del_channel @id`"
+    bot.send_message(message.chat.id, text, parse_mode="Markdown")
+
 # --- ЛОГИКА ЗАГРУЗКИ ---
 
 @bot.message_handler(func=lambda m: m.text == '📥 Добавить файл')
@@ -301,7 +368,13 @@ def receive_file(message):
         bot.register_next_step_handler(message, receive_file)
         return
 
-    user_states[message.chat.id] = {'file_id': f_id, 'file_type': f_type, 'desc': message.caption or ""}
+    username = message.from_user.username or f"user_{message.from_user.id}"
+    user_states[message.chat.id] = {
+        'file_id': f_id, 
+        'file_type': f_type, 
+        'desc': message.caption or "",
+        'uploader_username': username
+    }
     
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add(types.KeyboardButton('Пропустить'), types.KeyboardButton('❌ Отмена'))
@@ -355,8 +428,8 @@ def finish_upload(message, code):
     conn = sqlite3.connect('filebot.db')
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO files (code, file_id, file_type, description, password, uploader_id) VALUES (?, ?, ?, ?, ?, ?)",
-                       (code, data['file_id'], data['file_type'], data['desc'], data['password'], chat_id))
+        cursor.execute("INSERT INTO files (code, file_id, file_type, description, password, uploader_id, uploader_username) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       (code, data['file_id'], data['file_type'], data['desc'], data['password'], chat_id, data.get('uploader_username', username)))
         conn.commit()
         
         msg = f"✅ Готово!\n\n🔑 Код: `{code}`"
@@ -367,60 +440,6 @@ def finish_upload(message, code):
     finally:
         conn.close()
         user_states.pop(chat_id, None)
-
-# --- АДМИН-КОМАНДЫ ---
-
-@bot.message_handler(func=lambda m: m.text == '🛠 Панель управления' and is_admin(m.from_user.username))
-def admin_panel(message):
-    text = "🛠 *Панель управления*\n\n`/delete КОД` — удалить файл\n"
-    if is_main_admin(message.from_user.username):
-        text += "\n👑 *GA Команды:*\n`/add_admin @user` / `/del_admin @user`"
-        text += "\n`/add_channel @id link`\n`/del_channel @id`"
-    bot.send_message(message.chat.id, text, parse_mode="Markdown")
-
-@bot.message_handler(commands=['delete'])
-def admin_delete(message):
-    if not is_admin(message.from_user.username): return
-    args = message.text.split()
-    if len(args) < 2: return
-    conn = sqlite3.connect('filebot.db')
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM files WHERE code=?', (args[1],))
-    conn.commit()
-    bot.send_message(message.chat.id, f"Результат: удалено {cursor.rowcount} шт.")
-    conn.close()
-
-@bot.message_handler(commands=['add_admin', 'del_admin'])
-def manage_admins(message):
-    if not is_main_admin(message.from_user.username): return
-    args = message.text.split()
-    if len(args) < 2: return
-    user = args[1].replace('@', '').lower()
-    conn = sqlite3.connect('filebot.db')
-    cursor = conn.cursor()
-    if 'add' in message.text:
-        cursor.execute('INSERT OR IGNORE INTO admins VALUES (?)', (user,))
-        bot.send_message(message.chat.id, f"✅ {user} теперь админ.")
-    else:
-        cursor.execute('DELETE FROM admins WHERE username=?', (user,))
-        bot.send_message(message.chat.id, f"❌ {user} больше не админ.")
-    conn.commit()
-    conn.close()
-
-@bot.message_handler(commands=['add_channel', 'del_channel'])
-def manage_channels(message):
-    if not is_main_admin(message.from_user.username): return
-    args = message.text.split()
-    conn = sqlite3.connect('filebot.db')
-    cursor = conn.cursor()
-    if 'add' in message.text and len(args) >= 3:
-        cursor.execute('INSERT OR REPLACE INTO channels VALUES (?, ?)', (args[1], args[2]))
-        bot.send_message(message.chat.id, "✅ Канал добавлен.")
-    elif 'del' in message.text and len(args) >= 2:
-        cursor.execute('DELETE FROM channels WHERE channel_id=?', (args[1],))
-        bot.send_message(message.chat.id, "❌ Канал удален.")
-    conn.commit()
-    conn.close()
 
 if __name__ == '__main__':
     bot.infinity_polling()
