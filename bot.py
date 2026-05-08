@@ -86,13 +86,41 @@ def start_command(message):
         bot.send_message(message.chat.id, "❌ Для использования бота необходимо подписаться на наши каналы:", reply_markup=markup)
         return
 
-    args = message.text.split()[1:]
-    if args:
-        code = args[0]
-        password = args[1] if len(args) > 1 else None
-        process_download(message.chat.id, code, password)
+    args = message.text.split()
+    if len(args) >= 2:
+        code = args[1]
+        password = args[2] if len(args) > 2 else None
+        # Проверяем, есть ли у файла пароль
+        conn = sqlite3.connect('filebot.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT password FROM files WHERE code=?', (code,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row and row[0] and password is None:
+            # У файла есть пароль, но пароль не введен — запрашиваем
+            user_states[message.chat.id] = {'code': code}
+            bot.send_message(message.chat.id, "🔒 Этот файл защищен паролем. Введите пароль:")
+            bot.register_next_step_handler(message, ask_password_for_code)
+        else:
+            # Либо пароля нет, либо он введен
+            process_download(message.chat.id, code, password)
     else:
         bot.send_message(message.chat.id, "👋 Добро пожаловать в файлообменник!", reply_markup=get_main_menu(message.from_user.username))
+
+def ask_password_for_code(message):
+    """Запрашивает пароль, если пользователь ввел только код через /start"""
+    chat_id = message.chat.id
+    state = user_states.get(chat_id, {})
+    code = state.get('code')
+    
+    if not code:
+        bot.send_message(chat_id, "❌ Ошибка: код не найден. Попробуйте снова через /start <код>")
+        return
+    
+    password = message.text.strip()
+    process_download(chat_id, code, password)
+    user_states.pop(chat_id, None)
 
 @bot.callback_query_handler(func=lambda call: call.data == "check_sub")
 def callback_check_sub(call):
@@ -132,10 +160,16 @@ def process_download(chat_id, code, password):
 
     file_id, file_type, desc, real_password = row
 
-    if real_password and real_password != password:
-        bot.send_message(chat_id, "🔒 Неверный пароль или пароль не указан. Используйте: `/start код пароль`", parse_mode="Markdown")
-        return
+    # Если у файла есть пароль, а введенный пароль не совпадает
+    if real_password:
+        if password != real_password:
+            # Запоминаем код и запрашиваем пароль
+            user_states[chat_id] = {'code': code}
+            bot.send_message(chat_id, "🔒 Неверный пароль или пароль не указан. Введите пароль:")
+            bot.register_next_step_handler_by_chat_id(chat_id, ask_password_again)
+            return
 
+    # Если пароля нет, игнорируем переданный password (если он был)
     caption = f"📝 *Описание:* {desc}" if desc else ""
     try:
         if file_type == 'document':
@@ -144,8 +178,101 @@ def process_download(chat_id, code, password):
             bot.send_photo(chat_id, file_id, caption=caption, parse_mode="Markdown")
         elif file_type == 'video':
             bot.send_video(chat_id, file_id, caption=caption, parse_mode="Markdown")
+        bot.send_message(chat_id, "✅ Файл отправлен!", reply_markup=get_main_menu(None))
     except Exception as e:
         bot.send_message(chat_id, "❌ Ошибка при отправке файла.")
+
+def ask_password_again(message):
+    """Повторный запрос пароля при неверном вводе"""
+    chat_id = message.chat.id
+    state = user_states.get(chat_id, {})
+    code = state.get('code')
+    
+    if not code:
+        bot.send_message(chat_id, "❌ Ошибка: код не найден. Попробуйте снова.")
+        return
+    
+    password = message.text.strip()
+    # Убираем состояние, чтобы при повторной ошибке создать новое
+    user_states.pop(chat_id, None)
+    process_download(chat_id, code, password)
+
+# Добавляем вспомогательный метод для регистрации шага по chat_id
+def register_next_step_handler_by_chat_id(chat_id, callback):
+    """Обертка для регистрации следующего шага по chat_id"""
+    @bot.message_handler(func=lambda m: m.chat.id == chat_id)
+    def handler(message):
+        callback(message)
+        # Отключаем обработчик после выполнения
+        bot.message_handlers.remove(handler)
+
+# Более простой способ: используем register_next_step_handler с фильтром
+# Переопределим функцию для запроса пароля с сохранением состояния
+def ask_password_again(message):
+    chat_id = message.chat.id
+    state = user_states.get(chat_id, {})
+    code = state.get('code')
+    
+    if not code:
+        bot.send_message(chat_id, "❌ Ошибка: код не найден. Попробуйте снова.")
+        return
+    
+    password = message.text.strip()
+    user_states.pop(chat_id, None)
+    process_download(chat_id, code, password)
+
+# Исправляем регистрацию шага - используем стандартный register_next_step_handler
+# В process_download нужно вызывать register_next_step_handler
+
+# Перепишем process_download для корректной работы с запросом пароля
+def process_download(chat_id, code, password):
+    conn = sqlite3.connect('filebot.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT file_id, file_type, description, password FROM files WHERE code=?', (code,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        bot.send_message(chat_id, "❌ Файл с таким кодом не найден.", reply_markup=get_main_menu(None))
+        return
+
+    file_id, file_type, desc, real_password = row
+
+    # Если у файла есть пароль
+    if real_password:
+        if password != real_password:
+            # Сохраняем код и запрашиваем пароль
+            user_states[chat_id] = {'code': code}
+            msg = bot.send_message(chat_id, "🔒 Введите пароль:")
+            bot.register_next_step_handler(msg, ask_password_callback)
+            return
+
+    # Отправляем файл (если пароля нет или он верный)
+    caption = f"📝 *Описание:* {desc}" if desc else ""
+    try:
+        if file_type == 'document':
+            bot.send_document(chat_id, file_id, caption=caption, parse_mode="Markdown")
+        elif file_type == 'photo':
+            bot.send_photo(chat_id, file_id, caption=caption, parse_mode="Markdown")
+        elif file_type == 'video':
+            bot.send_video(chat_id, file_id, caption=caption, parse_mode="Markdown")
+        bot.send_message(chat_id, "✅ Файл отправлен!", reply_markup=get_main_menu(None))
+    except Exception as e:
+        bot.send_message(chat_id, "❌ Ошибка при отправке файла.")
+
+def ask_password_callback(message):
+    """Callback для получения пароля"""
+    chat_id = message.chat.id
+    state = user_states.get(chat_id, {})
+    code = state.get('code')
+    
+    if not code:
+        bot.send_message(chat_id, "❌ Ошибка: код не найден. Попробуйте снова.")
+        return
+    
+    password = message.text.strip()
+    user_states.pop(chat_id, None)
+    process_download(chat_id, code, password)
 
 # --- ЛОГИКА ЗАГРУЗКИ ---
 
